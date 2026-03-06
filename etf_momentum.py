@@ -6,13 +6,17 @@
 """
 
 import json
+import os
+import random
+import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
@@ -49,6 +53,131 @@ class EtfMomentum:
                 closes[fp.stem] = df["Close"]
         panel = pd.DataFrame(closes).sort_index().ffill()
         return panel
+
+    @staticmethod
+    def _to_yf_symbol(raw: str) -> str:
+        """SH510500 -> 510500.SS, SZ159941 -> 159941.SZ"""
+        raw = raw.strip().upper()
+        if raw.startswith("SH"):
+            return raw[2:] + ".SS"
+        if raw.startswith("SZ"):
+            return raw[2:] + ".SZ"
+        return raw
+
+    def _csv_path(self, raw_symbol: str) -> Path:
+        return self._db_dir / f"{raw_symbol.strip().upper()}.csv"
+
+    def reload_data(self) -> None:
+        """重新加载 db 数据并刷新缓存（更新后调用）。"""
+        self._panel = self._load_panel()
+        self._log_close = np.log(self._panel.replace(0, np.nan))
+        self._daily_ret = self._panel.pct_change()
+        self._linreg_cache = {}
+
+    def update_db_incremental(
+        self,
+        symbols: Optional[List[str]] = None,
+        proxy: Optional[str] = None,
+        max_rounds: int = 10,
+        sleep_min: float = 1.0,
+        sleep_max: float = 2.0,
+        period_for_new: str = "12y",
+        reload_after: bool = True,
+    ) -> dict:
+        """增量更新本地 db 目录下的数据（避免每次全量下载）。
+
+        - 若本地已有 CSV：从最后日期 +1 天开始下载并追加
+        - 若本地没有 CSV：下载 period_for_new 对应的全量数据并写入
+        - 若遇到限流/网络错误：按“轮次”重试失败标的，最多 max_rounds 轮
+        """
+        if proxy:
+            os.environ["HTTP_PROXY"] = proxy
+            os.environ["HTTPS_PROXY"] = proxy
+
+        if symbols is None:
+            symbols = sorted([fp.stem for fp in self._db_dir.glob("*.csv")])
+
+        remaining = [s.strip().upper() for s in symbols]
+        ok: set[str] = set()
+        last_errors: dict[str, str] = {}
+
+        for round_idx in range(1, max_rounds + 1):
+            if not remaining:
+                break
+
+            failed: list[str] = []
+
+            for sym in remaining:
+                try:
+                    self._update_one_symbol(sym, period_for_new=period_for_new)
+                    ok.add(sym)
+                except Exception as e:
+                    last_errors[sym] = str(e)
+                    failed.append(sym)
+
+                time.sleep(random.uniform(sleep_min, sleep_max))
+
+            remaining = failed
+
+            if remaining:
+                # 每轮失败后稍作等待再继续，缓解限流
+                backoff = min(60, 2 ** round_idx)
+                time.sleep(backoff)
+
+        summary = {
+            "ok": len(ok),
+            "fail": len(remaining),
+            "failed_symbols": remaining,
+            "last_errors": {k: last_errors[k] for k in remaining},
+        }
+
+        if reload_after:
+            self.reload_data()
+
+        if remaining:
+            raise RuntimeError(f"增量更新仍失败（共 {len(remaining)} 只）: {remaining[:10]}")
+
+        return summary
+
+    def _update_one_symbol(self, raw_symbol: str, period_for_new: str = "12y") -> None:
+        raw_symbol = raw_symbol.strip().upper()
+        fp = self._csv_path(raw_symbol)
+        yf_sym = self._to_yf_symbol(raw_symbol)
+
+        existing = None
+        start = None
+        end = datetime.now().strftime("%Y-%m-%d")
+
+        if fp.exists():
+            existing = pd.read_csv(fp, index_col=0, parse_dates=True)
+            if not existing.empty:
+                last_date = existing.index.max()
+                start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                if start >= end:
+                    return
+
+        if start:
+            hist = yf.Ticker(yf_sym).history(start=start, end=end)
+        else:
+            hist = yf.Ticker(yf_sym).history(period=period_for_new)
+
+        if hist is None or hist.empty:
+            # 无新增也算成功（可能是停牌/无交易/刚好到最新）
+            return
+
+        keep_cols = ["Open", "High", "Low", "Close", "Volume"]
+        hist = hist[[c for c in keep_cols if c in hist.columns]].copy()
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_localize(None)
+        hist.index.name = "Date"
+
+        if existing is not None and not existing.empty:
+            combined = pd.concat([existing, hist])
+            combined = combined[~combined.index.duplicated(keep="last")]
+            combined.sort_index(inplace=True)
+            combined.to_csv(fp)
+        else:
+            hist.to_csv(fp)
 
     def _get_name(self, symbol: str) -> str:
         return self._etf_name_map.get(symbol, "")

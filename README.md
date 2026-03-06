@@ -8,6 +8,43 @@
 
 当前回测使用 **ETF 动量 + R² 过滤** 的规则，在池内选趋势强且拟合好的标的持有，定期调仓。
 
+---
+
+## Engine 使用方法（`etf_momentum.py`）
+
+### 1) 生成历史调仓明细（并导出到 `history/{date}/`）
+
+```python
+from etf_momentum import EtfMomentum
+
+engine = EtfMomentum(db_dir="db")
+
+# 生成调仓明细，并导出到 history/YYYYMMDD/history_{n}_{r2}_{rebal}_{top_k}.csv
+df = engine.back_history(n=5, r2_threshold=0.6, rebal_period=5, top_k=1)
+print(df.head())
+```
+
+### 2) 获取当前持仓建议
+
+```python
+signal = engine.next(n=5, r2_threshold=0.6, top_k=1)
+print(signal["date"], signal["action"])
+print(signal["holdings"])
+```
+
+### 3) 增量更新本地 `db/`（避免频繁全量下载触发限流）
+
+```python
+# 增量更新：从每只 ETF 本地最后日期之后开始下载，失败会按“轮次”重试（最多 10 轮）
+engine.update_db_incremental(
+    symbols=None,         # None=更新 db 目录下已有 CSV 的全部标的
+    proxy=None,           # 如需代理: "http://127.0.0.1:7890"
+    max_rounds=10,
+)
+
+# 更新完后 engine 会自动 reload 数据（可用于下一步 next/back_history）
+```
+
 ### 1. 策略思路
 
 - **动量**：用过去一段时间价格走势的“斜率”衡量强弱，斜率大视为动量强。
