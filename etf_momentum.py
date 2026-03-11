@@ -146,18 +146,19 @@ class EtfMomentum:
 
         existing = None
         start = None
-        end = datetime.now().strftime("%Y-%m-%d")
+        # yfinance 的 end 为左闭右开，要包含“今天”需传 end=明天
+        end_exclusive = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
 
         if fp.exists():
             existing = pd.read_csv(fp, index_col=0, parse_dates=True)
             if not existing.empty:
                 last_date = existing.index.max()
                 start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-                if start >= end:
+                if start >= end_exclusive:
                     return
 
         if start:
-            hist = yf.Ticker(yf_sym).history(start=start, end=end)
+            hist = yf.Ticker(yf_sym).history(start=start, end=end_exclusive)
         else:
             hist = yf.Ticker(yf_sym).history(period=period_for_new)
 
