@@ -1,8 +1,8 @@
 """
-ETF 历史数据管理器 —— 支持 yfinance / akshare 两种数据源下载 etf_pool.csv 中的 ETF 日线数据，
+ETF 历史数据管理器 —— 支持多数据源下载 etf_pool.csv 中的 ETF 日线数据，
 按标的逐只存储到 db/ 目录，支持增量更新，适配动量策略回测需求。
 
-yfinance 对部分沪深 ETF 存在异常涨跌幅（如单日 +300%/-75%），建议使用 data_source="akshare"。
+数据源: akshare(推荐) / efinance / eastmoney(东方财富直连) / yfinance / baostock(多仅 A 股)。
 """
 
 import os
@@ -23,6 +23,16 @@ try:
     import akshare as ak
 except ImportError:
     ak = None
+
+try:
+    import baostock as bs
+except ImportError:
+    bs = None
+
+try:
+    import efinance as ef
+except ImportError:
+    ef = None
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +64,26 @@ def _to_ak_symbol(raw: str) -> str:
     raw = raw.strip().upper()
     if raw.startswith("SH") or raw.startswith("SZ"):
         return raw[2:]
+    return raw
+
+
+def _to_bs_symbol(raw: str) -> str:
+    """SH510500 -> sh.510500, SZ159941 -> sz.159941（baostock 小写 sh/sz + 点 + 代码）"""
+    raw = raw.strip().upper()
+    if raw.startswith("SH"):
+        return "sh." + raw[2:]
+    if raw.startswith("SZ"):
+        return "sz." + raw[2:]
+    return raw
+
+
+def _to_em_secid(raw: str) -> str:
+    """东方财富 K 线接口 secid：SH510500 -> 1.510500，SZ159941 -> 0.159941"""
+    raw = raw.strip().upper()
+    if raw.startswith("SH"):
+        return "1." + raw[2:]
+    if raw.startswith("SZ"):
+        return "0." + raw[2:]
     return raw
 
 
@@ -107,6 +137,8 @@ class EtfDataManager:
         proxy: str | None = None,
         max_retries: int = 3,
         data_source: str = "akshare",
+        baostock_user: str | None = None,
+        baostock_password: str | None = None,
     ):
         """
         data_source : "yfinance" | "akshare"
@@ -117,12 +149,19 @@ class EtfDataManager:
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.max_retries = max_retries
         self._data_source = (data_source or "akshare").strip().lower()
-        if self._data_source not in ("yfinance", "akshare"):
+        if self._data_source not in ("yfinance", "akshare", "baostock", "efinance", "eastmoney"):
             self._data_source = "akshare"
         if self._data_source == "akshare" and ak is None:
             raise ImportError("使用 data_source='akshare' 请先安装: pip install akshare")
         if self._data_source == "yfinance" and yf is None:
             raise ImportError("使用 data_source='yfinance' 请先安装: pip install yfinance")
+        if self._data_source == "baostock" and bs is None:
+            raise ImportError("使用 data_source='baostock' 请先安装: pip install baostock")
+        if self._data_source == "efinance" and ef is None:
+            raise ImportError("使用 data_source='efinance' 请先安装: pip install efinance")
+        # eastmoney 直连仅用标准库 urllib，无需额外安装
+        self._bs_user = baostock_user or os.environ.get("BOOSTOCK_USER", "anonymous")
+        self._bs_pass = baostock_password or os.environ.get("BOOSTOCK_PASS", "123456")
 
         if proxy:
             os.environ["HTTP_PROXY"] = proxy
@@ -215,6 +254,139 @@ class EtfDataManager:
                 time.sleep(wait)
         raise last_err  # type: ignore[misc]
 
+    def _fetch_history_baostock(
+        self, raw_symbol: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """Baostock 日线（前复权）。返回与 _clean 兼容的 DataFrame。
+        注意：Baostock 可能仅支持 A 股，ETF 常返回 0 行，此时请用 akshare。
+        start_date/end_date 格式 YYYYMMDD，内部会转为 YYYY-MM-DD。
+        """
+        code = _to_bs_symbol(raw_symbol)
+        start_d = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+        end_d = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+        try:
+            lg = bs.login(user_id=self._bs_user, password=self._bs_pass)
+            if lg.error_code != "0":
+                logger.warning("Baostock 登录失败: %s %s", lg.error_code, lg.error_msg)
+                return pd.DataFrame()
+        except Exception as e:
+            logger.warning("Baostock 登录异常: %s", e)
+            return pd.DataFrame()
+        try:
+            rs = bs.query_history_k_data_plus(
+                code,
+                "date,open,high,low,close,volume",
+                start_date=start_d,
+                end_date=end_d,
+                frequency="d",
+                adjustflag="2",
+            )
+            if rs.error_code != "0":
+                logger.debug("Baostock %s: %s %s", code, rs.error_code, rs.error_msg)
+                return pd.DataFrame()
+            data = []
+            while rs.error_code == "0" and rs.next():
+                data.append(rs.get_row_data())
+            if not data:
+                logger.debug("Baostock %s 返回 0 行（ETF 可能不受支持）", code)
+                return pd.DataFrame()
+            df = pd.DataFrame(data, columns=rs.fields)
+            df = df.rename(columns={"date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+            keep = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep].copy()
+            for c in ["Open", "High", "Low", "Close", "Volume"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.set_index("Date").sort_index()
+            df.index.name = "Date"
+            return df
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+
+    def _fetch_history_efinance(
+        self, raw_symbol: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """efinance 获取 ETF 日线（数据源为东方财富），返回与 _clean 兼容的 DataFrame。
+        start_date/end_date 格式 YYYYMMDD。
+        """
+        code = _to_ak_symbol(raw_symbol)
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                df = ef.stock.get_quote_history(code)
+                if df is None or df.empty:
+                    return pd.DataFrame()
+                df = df.rename(columns={"日期": "Date", "开盘": "Open", "收盘": "Close", "最高": "High", "最低": "Low", "成交量": "Volume"})
+                keep = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep].copy()
+                df["Date"] = pd.to_datetime(df["Date"])
+                df = df.set_index("Date").sort_index()
+                start_d = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+                end_d = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+                df = df.loc[start_d:end_d]
+                for c in ["Open", "High", "Low", "Close", "Volume"]:
+                    if c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                df.index.name = "Date"
+                return df
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    logger.warning("efinance %s 失败: %s", raw_symbol, e)
+                    return pd.DataFrame()
+                time.sleep(min(30, 2 ** attempt))
+        return pd.DataFrame()
+
+    def _fetch_history_eastmoney(
+        self, raw_symbol: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """东方财富 K 线直连 API，前复权。start_date/end_date 格式 YYYYMMDD。"""
+        import json
+        import ssl
+        import urllib.request
+        secid = _to_em_secid(raw_symbol)
+        url = (
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+            f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+            f"&klt=101&fqt=1&beg={start_date}&end={end_date}&lmt=10000"
+        )
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                ctx = ssl.create_default_context()
+                if os.environ.get("EASTMONEY_SSL_VERIFY", "1") == "0":
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+                    data = json.loads(r.read().decode())
+                if not data.get("data") or not data["data"].get("klines"):
+                    return pd.DataFrame()
+                rows = []
+                for s in data["data"]["klines"]:
+                    parts = s.split(",")
+                    if len(parts) >= 6:
+                        rows.append({
+                            "Date": parts[0],
+                            "Open": float(parts[1]),
+                            "Close": float(parts[2]),
+                            "High": float(parts[3]),
+                            "Low": float(parts[4]),
+                            "Volume": float(parts[5]),
+                        })
+                df = pd.DataFrame(rows)
+                df["Date"] = pd.to_datetime(df["Date"])
+                df = df.set_index("Date").sort_index()
+                df.index.name = "Date"
+                return df
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    logger.warning("东方财富直连 %s 失败: %s", raw_symbol, e)
+                    return pd.DataFrame()
+                time.sleep(min(30, 2 ** attempt))
+        return pd.DataFrame()
+
     def download_one(
         self,
         raw_symbol: str,
@@ -257,6 +429,24 @@ class EtfDataManager:
                             start_d.replace("-", ""),
                             end_d.replace("-", ""),
                         )
+                    elif self._data_source == "baostock":
+                        new_data = self._fetch_history_baostock(
+                            raw_symbol,
+                            start_d.replace("-", ""),
+                            end_d.replace("-", ""),
+                        )
+                    elif self._data_source == "efinance":
+                        new_data = self._fetch_history_efinance(
+                            raw_symbol,
+                            start_d.replace("-", ""),
+                            end_d.replace("-", ""),
+                        )
+                    elif self._data_source == "eastmoney":
+                        new_data = self._fetch_history_eastmoney(
+                            raw_symbol,
+                            start_d.replace("-", ""),
+                            end_d.replace("-", ""),
+                        )
                     else:
                         end_exclusive = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
                         new_data = self._fetch_history_yf(
@@ -278,6 +468,15 @@ class EtfDataManager:
             if self._data_source == "akshare":
                 start_str, end_str = _parse_period_to_dates(period)
                 hist = self._fetch_history_akshare(raw_symbol, start_str, end_str)
+            elif self._data_source == "baostock":
+                start_str, end_str = _parse_period_to_dates(period)
+                hist = self._fetch_history_baostock(raw_symbol, start_str, end_str)
+            elif self._data_source == "efinance":
+                start_str, end_str = _parse_period_to_dates(period)
+                hist = self._fetch_history_efinance(raw_symbol, start_str, end_str)
+            elif self._data_source == "eastmoney":
+                start_str, end_str = _parse_period_to_dates(period)
+                hist = self._fetch_history_eastmoney(raw_symbol, start_str, end_str)
             else:
                 hist = self._fetch_history_yf(_to_yf_symbol(raw_symbol), period=period)
         except Exception as e:
@@ -456,7 +655,7 @@ def main():
     parser.add_argument("--pool", default=str(DEFAULT_POOL_CSV), help="ETF 池 CSV 路径")
     parser.add_argument("--db", default=str(DEFAULT_DB_DIR), help="本地存储目录")
     parser.add_argument("--proxy", default=None, help="HTTP(S) 代理，如 http://127.0.0.1:1087")
-    parser.add_argument("--source", default="akshare", choices=("akshare", "yfinance"), help="数据源，默认 akshare 避免异常涨跌幅")
+    parser.add_argument("--source", default="akshare", choices=("akshare", "yfinance", "baostock", "efinance", "eastmoney"), help="数据源: akshare/efinance/eastmoney(东方财富)/yfinance/baostock")
     parser.add_argument("--period", default=DEFAULT_PERIOD, help="下载周期（全量时生效），12y / from2014 等")
     parser.add_argument("--from-2014", action="store_true", help="全量时从 2014-01-01 开始下载（等同 --period from2014）")
     parser.add_argument("--full", action="store_true", help="全量下载（忽略本地已有数据）")
