@@ -83,12 +83,14 @@ class EtfMomentum:
         sleep_max: float = 2.0,
         period_for_new: str = "12y",
         reload_after: bool = True,
+        update_source: str = "yfinance",
     ) -> dict:
         """增量更新本地 db 目录下的数据（避免每次全量下载）。
 
         - 若本地已有 CSV：从最后日期 +1 天开始下载并追加
         - 若本地没有 CSV：下载 period_for_new 对应的全量数据并写入
         - 若遇到限流/网络错误：按“轮次”重试失败标的，最多 max_rounds 轮
+        - update_source: "yfinance" | "akshare"，推荐 "akshare" 避免沪深 ETF 异常涨跌幅
         """
         if proxy:
             os.environ["HTTP_PROXY"] = proxy
@@ -96,6 +98,14 @@ class EtfMomentum:
 
         if symbols is None:
             symbols = sorted([fp.stem for fp in self._db_dir.glob("*.csv")])
+
+        use_akshare = (update_source or "").strip().lower() == "akshare"
+        if use_akshare:
+            try:
+                from etf_data_manager import EtfDataManager
+            except ImportError:
+                from .etf_data_manager import EtfDataManager
+            data_mgr = EtfDataManager(db_dir=str(self._db_dir), proxy=proxy, data_source="akshare")
 
         remaining = [s.strip().upper() for s in symbols]
         ok: set[str] = set()
@@ -109,7 +119,12 @@ class EtfMomentum:
 
             for sym in remaining:
                 try:
-                    self._update_one_symbol(sym, period_for_new=period_for_new)
+                    if use_akshare:
+                        result = data_mgr.download_one(sym, period=period_for_new, incremental=True)
+                        if result is None:
+                            raise RuntimeError("download_one 返回 None")
+                    else:
+                        self._update_one_symbol(sym, period_for_new=period_for_new)
                     ok.add(sym)
                 except Exception as e:
                     last_errors[sym] = str(e)

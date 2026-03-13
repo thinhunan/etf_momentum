@@ -10,9 +10,12 @@
 """
 
 import argparse
+import multiprocessing as mp
+import os
 import time
 import warnings
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from itertools import product
 from pathlib import Path
@@ -21,6 +24,8 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
+
+_NUM_WORKERS = max(1, os.cpu_count() - 1)  # 留 1 核给系统
 
 SLIPPAGE = 0.001
 COMMISSION = 0.00006
@@ -91,6 +96,7 @@ def backtest_momentum(
             if sorted(new_holdings) != sorted(current_holdings):
                 if current_holdings and d > 0:
                     prev_date = dates[d - 1]
+                    k_sell = len(current_holdings)
                     sell_rets = []
                     for sym in current_holdings:
                         prev_cl = panel.loc[prev_date, sym]
@@ -100,11 +106,12 @@ def backtest_momentum(
                             else panel.loc[date, sym]
                         )
                         sell_rets.append(op * (1 - slippage) / prev_cl - 1)
-                    cum *= 1 + np.nanmean(sell_rets)
-                    cum *= 1 - commission
+                    cum *= 1 + np.nansum(sell_rets) / top_k
+                    cum *= 1 - k_sell / top_k * commission
 
                 if new_holdings:
-                    cum *= 1 - commission
+                    k_buy = len(new_holdings)
+                    cum *= 1 - k_buy / top_k * commission
                     buy_rets = []
                     for sym in new_holdings:
                         op = (
@@ -114,21 +121,17 @@ def backtest_momentum(
                         )
                         cl = panel.loc[date, sym]
                         buy_rets.append(cl / (op * (1 + slippage)) - 1)
-                    cum *= 1 + np.nanmean(buy_rets)
+                    cum *= 1 + np.nansum(buy_rets) / top_k
 
                 current_holdings = new_holdings
             else:
                 if current_holdings:
-                    ret = daily_ret.loc[date, current_holdings].mean()
-                    if np.isnan(ret):
-                        ret = 0.0
-                    cum *= 1 + ret
+                    rets = daily_ret.loc[date, current_holdings]
+                    cum *= 1 + np.nansum(rets.values) / top_k
         else:
             if current_holdings:
-                ret = daily_ret.loc[date, current_holdings].mean()
-                if np.isnan(ret):
-                    ret = 0.0
-                cum *= 1 + ret
+                rets = daily_ret.loc[date, current_holdings]
+                cum *= 1 + np.nansum(rets.values) / top_k
 
         nav_values[d] = cum
 
@@ -136,11 +139,60 @@ def backtest_momentum(
 
 
 # ------------------------------------------------------------------
-# 批量回测 → DataFrame
+# 多进程并行回测
 # ------------------------------------------------------------------
 
-def run_batch_backtest(panel, panel_open, start_date=None):
-    """对全部参数网格跑一次回测，返回 result_df。"""
+# fork 模式下子进程通过 copy-on-write 共享这些全局变量，无序列化开销
+_g_panel = None
+_g_panel_open = None
+_g_daily_ret = None
+_g_linreg_cache = None
+
+
+def _init_shared(panel, panel_open, daily_ret, linreg_cache):
+    """进程池 initializer：将共享数据写入 worker 全局变量。"""
+    global _g_panel, _g_panel_open, _g_daily_ret, _g_linreg_cache
+    _g_panel = panel
+    _g_panel_open = panel_open
+    _g_daily_ret = daily_ret
+    _g_linreg_cache = linreg_cache
+
+
+def _backtest_one(params):
+    """单个参数组合的回测 + 指标计算（在 worker 进程中执行）。"""
+    n, r2_thresh, rebal, top_k = params
+    slope, r2 = _g_linreg_cache[n]
+    nav = backtest_momentum(
+        slope, r2, _g_daily_ret, _g_panel, _g_panel_open,
+        n=n, r2_threshold=r2_thresh,
+        rebal_period=rebal, top_k=top_k,
+    )
+
+    years = sorted(nav.index.year.unique())
+    annual_rets = {}
+    for yr in years:
+        yr_nav = nav[nav.index.year == yr]
+        if len(yr_nav) < 10:
+            continue
+        annual_rets[yr] = yr_nav.iloc[-1] / yr_nav.iloc[0] - 1
+
+    full_years = [y for y in annual_rets if y != years[0] and y != years[-1]]
+    avg_ret = np.mean([annual_rets[y] for y in full_years]) if full_years else np.nan
+
+    total_ret = nav.iloc[-1] / nav.iloc[0] - 1
+    n_years = (nav.index[-1] - nav.index[0]).days / 365.25
+
+    row = {"n": n, "R2_threshold": r2_thresh, "rebal_period": rebal, "top_k": top_k}
+    row.update(annual_rets)
+    row["avg_full_year"] = avg_ret
+    row["annualized"] = (1 + total_ret) ** (1 / n_years) - 1 if n_years > 0 else np.nan
+    row["total_ret"] = total_ret
+    row["max_drawdown"] = ((nav / nav.cummax()) - 1).min()
+    return row
+
+
+def run_batch_backtest(panel, panel_open, start_date=None, workers=_NUM_WORKERS):
+    """对全部参数网格跑一次回测（多进程并行），返回 result_df。"""
     if start_date:
         panel = panel.loc[start_date:]
         panel_open = panel_open.loc[start_date:]
@@ -148,46 +200,23 @@ def run_batch_backtest(panel, panel_open, start_date=None):
     log_close = np.log(panel.replace(0, np.nan))
     daily_ret = panel.pct_change()
 
+    print(f"  预计算 rolling linreg（{len(N_LIST)} 个 n 值）...")
     linreg_cache = {}
     for n in N_LIST:
         linreg_cache[n] = rolling_linreg(log_close, n)
 
     param_grid = list(product(N_LIST, R2_LIST, REBAL_LIST, TOP_K_LIST))
-    results = []
+    print(f"  参数组合: {len(param_grid)}，使用 {workers} 个进程并行回测...")
 
     t0 = time.time()
-    for i, (n, r2_thresh, rebal, top_k) in enumerate(param_grid):
-        if (i + 1) % 100 == 0 or i == 0:
-            print(f"  回测进度: {i+1}/{len(param_grid)}")
-
-        slope, r2 = linreg_cache[n]
-        nav = backtest_momentum(
-            slope, r2, daily_ret, panel, panel_open,
-            n=n, r2_threshold=r2_thresh,
-            rebal_period=rebal, top_k=top_k,
-        )
-
-        years = sorted(nav.index.year.unique())
-        annual_rets = {}
-        for yr in years:
-            yr_nav = nav[nav.index.year == yr]
-            if len(yr_nav) < 10:
-                continue
-            annual_rets[yr] = yr_nav.iloc[-1] / yr_nav.iloc[0] - 1
-
-        full_years = [y for y in annual_rets if y != years[0] and y != years[-1]]
-        avg_ret = np.mean([annual_rets[y] for y in full_years]) if full_years else np.nan
-
-        total_ret = nav.iloc[-1] / nav.iloc[0] - 1
-        n_years = (nav.index[-1] - nav.index[0]).days / 365.25
-
-        row = {"n": n, "R2_threshold": r2_thresh, "rebal_period": rebal, "top_k": top_k}
-        row.update(annual_rets)
-        row["avg_full_year"] = avg_ret
-        row["annualized"] = (1 + total_ret) ** (1 / n_years) - 1 if n_years > 0 else np.nan
-        row["total_ret"] = total_ret
-        row["max_drawdown"] = ((nav / nav.cummax()) - 1).min()
-        results.append(row)
+    ctx = mp.get_context("fork")
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=ctx,
+        initializer=_init_shared,
+        initargs=(panel, panel_open, daily_ret, linreg_cache),
+    ) as executor:
+        results = list(executor.map(_backtest_one, param_grid, chunksize=20))
 
     elapsed = time.time() - t0
     print(f"  回测完成: {len(results)} 组参数，耗时 {elapsed:.0f}s")
@@ -202,6 +231,7 @@ def main():
     parser = argparse.ArgumentParser(description="ETF 动量策略日报工具")
     parser.add_argument("--proxy", default="http://127.0.0.1:1087", help="HTTP 代理地址")
     parser.add_argument("--no-update", action="store_true", help="跳过数据更新")
+    parser.add_argument("--source", default="akshare", choices=("akshare", "yfinance"), help="数据更新源，默认 akshare 避免异常涨跌幅")
     parser.add_argument("--top", type=int, default=5, help="12年/3年各取 top N 参数")
     parser.add_argument("--output", default="report", help="报告输出目录")
     args = parser.parse_args()
@@ -218,7 +248,7 @@ def main():
         print("=" * 60)
         print("Step 1: 更新数据")
         print("=" * 60)
-        result = engine.update_db_incremental(proxy=args.proxy, max_rounds=10)
+        result = engine.update_db_incremental(proxy=args.proxy, max_rounds=10, update_source=args.source)
         print(f"  成功: {result['ok']}，失败: {result['fail']}")
         if result["failed_symbols"]:
             print(f"  失败标的: {result['failed_symbols']}")

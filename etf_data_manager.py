@@ -1,6 +1,8 @@
 """
-ETF 历史数据管理器 —— 基于 yfinance 下载 etf_pool.csv 中的 ETF 日线数据，
+ETF 历史数据管理器 —— 支持 yfinance / akshare 两种数据源下载 etf_pool.csv 中的 ETF 日线数据，
 按标的逐只存储到 db/ 目录，支持增量更新，适配动量策略回测需求。
+
+yfinance 对部分沪深 ETF 存在异常涨跌幅（如单日 +300%/-75%），建议使用 data_source="akshare"。
 """
 
 import os
@@ -11,7 +13,16 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 import pandas as pd
-import yfinance as yf
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +49,42 @@ def _to_local_symbol(raw: str) -> str:
     return raw.strip().upper()
 
 
+def _to_ak_symbol(raw: str) -> str:
+    """SH510500 -> 510500, SZ159941 -> 159941（akshare 使用纯数字代码）"""
+    raw = raw.strip().upper()
+    if raw.startswith("SH") or raw.startswith("SZ"):
+        return raw[2:]
+    return raw
+
+
+# 全量下载时默认从 2014 年开始（池中多数 ETF 可追溯至此）
+START_DATE_2014 = "20140101"
+
+
+def _parse_period_to_dates(period: str) -> tuple[str, str]:
+    """将 yfinance 风格 period（如 12y）或 from2014 转为 (start_date, end_date) YYYYMMDD。"""
+    end = datetime.now().date()
+    end_str = end.strftime("%Y%m%d")
+    period = (period or "").strip().lower()
+    if period == "from2014":
+        return START_DATE_2014, end_str
+    if not period or period == "max":
+        start = end - timedelta(days=365 * 20)
+    elif period.endswith("y"):
+        years = int(period[:-1])
+        start = end - timedelta(days=365 * years)
+    elif period.endswith("mo"):
+        months = int(period[:-2])
+        start = end - timedelta(days=30 * months)
+    elif period.endswith("d"):
+        days = int(period[:-1])
+        start = end - timedelta(days=days)
+    else:
+        start = end - timedelta(days=365 * 12)
+    start_str = start.strftime("%Y%m%d")
+    return start_str, end_str
+
+
 class EtfDataManager:
     """管理 ETF 池历史行情的下载与本地持久化。
 
@@ -59,11 +106,23 @@ class EtfDataManager:
         db_dir: str | Path = DEFAULT_DB_DIR,
         proxy: str | None = None,
         max_retries: int = 3,
+        data_source: str = "akshare",
     ):
+        """
+        data_source : "yfinance" | "akshare"
+            默认 "akshare"，避免沪深 ETF 在 Yahoo 上的异常涨跌幅；需安装 akshare。
+        """
         self.pool_csv = Path(pool_csv)
         self.db_dir = Path(db_dir)
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.max_retries = max_retries
+        self._data_source = (data_source or "akshare").strip().lower()
+        if self._data_source not in ("yfinance", "akshare"):
+            self._data_source = "akshare"
+        if self._data_source == "akshare" and ak is None:
+            raise ImportError("使用 data_source='akshare' 请先安装: pip install akshare")
+        if self._data_source == "yfinance" and yf is None:
+            raise ImportError("使用 data_source='yfinance' 请先安装: pip install yfinance")
 
         if proxy:
             os.environ["HTTP_PROXY"] = proxy
@@ -99,7 +158,7 @@ class EtfDataManager:
     def _file_path(self, raw_symbol: str) -> Path:
         return self.db_dir / f"{_to_local_symbol(raw_symbol)}.csv"
 
-    def _fetch_history(self, yf_sym: str, **kwargs) -> pd.DataFrame:
+    def _fetch_history_yf(self, yf_sym: str, **kwargs) -> pd.DataFrame:
         """带指数退避重试的 yfinance 数据获取。"""
         last_err = None
         for attempt in range(1, self.max_retries + 1):
@@ -112,6 +171,46 @@ class EtfDataManager:
                 logger.debug(
                     "%s 第 %d 次尝试失败 (%s)，%ds 后重试",
                     yf_sym, attempt, e, wait,
+                )
+                time.sleep(wait)
+        raise last_err  # type: ignore[misc]
+
+    def _fetch_history_akshare(
+        self, raw_symbol: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """akshare 东方财富 ETF 日线，返回与 _clean 兼容的 DataFrame（Open/High/Low/Close/Volume）。
+        使用前复权 qfq 避免除权除息导致的单日虚假涨跌幅（如 +300%/-75%）。
+        遇限流或网络错误时指数退避重试。
+        """
+        sym = _to_ak_symbol(raw_symbol)
+        last_err = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                df = ak.fund_etf_hist_em(
+                    symbol=sym,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="qfq",
+                )
+                if df is None or df.empty:
+                    return pd.DataFrame()
+                # 列名: 日期 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅 涨跌额 换手率
+                rename = {"日期": "Date", "开盘": "Open", "收盘": "Close", "最高": "High", "最低": "Low", "成交量": "Volume"}
+                df = df.rename(columns=rename)
+                keep = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep].copy()
+                df["Date"] = pd.to_datetime(df["Date"])
+                df = df.set_index("Date").sort_index()
+                df.index = df.index.tz_localize(None)
+                df.index.name = "Date"
+                return df
+            except Exception as e:
+                last_err = e
+                wait = min(60, 2 ** attempt)
+                logger.debug(
+                    "%s 第 %d 次尝试失败 (%s)，%ds 后重试",
+                    raw_symbol, attempt, e, wait,
                 )
                 time.sleep(wait)
         raise last_err  # type: ignore[misc]
@@ -139,7 +238,6 @@ class EtfDataManager:
         pd.DataFrame | None
             下载到的数据（合并后），失败返回 None。
         """
-        yf_sym = _to_yf_symbol(raw_symbol)
         file_path = self._file_path(raw_symbol)
 
         existing = None
@@ -147,13 +245,23 @@ class EtfDataManager:
             existing = pd.read_csv(file_path, index_col=0, parse_dates=True)
             if not existing.empty:
                 last_date = existing.index.max()
-                start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-                end = datetime.now().strftime("%Y-%m-%d")
-                if start >= end:
+                start_d = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                end_d = datetime.now().strftime("%Y-%m-%d")
+                if start_d >= end_d:
                     logger.debug("%s 已是最新，跳过", raw_symbol)
                     return existing
                 try:
-                    new_data = self._fetch_history(yf_sym, start=start, end=end)
+                    if self._data_source == "akshare":
+                        new_data = self._fetch_history_akshare(
+                            raw_symbol,
+                            start_d.replace("-", ""),
+                            end_d.replace("-", ""),
+                        )
+                    else:
+                        end_exclusive = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+                        new_data = self._fetch_history_yf(
+                            _to_yf_symbol(raw_symbol), start=start_d, end=end_exclusive
+                        )
                 except Exception as e:
                     logger.warning("增量下载 %s 失败: %s", raw_symbol, e)
                     return existing
@@ -167,7 +275,11 @@ class EtfDataManager:
                 return combined
 
         try:
-            hist = self._fetch_history(yf_sym, period=period)
+            if self._data_source == "akshare":
+                start_str, end_str = _parse_period_to_dates(period)
+                hist = self._fetch_history_akshare(raw_symbol, start_str, end_str)
+            else:
+                hist = self._fetch_history_yf(_to_yf_symbol(raw_symbol), period=period)
         except Exception as e:
             logger.warning("下载 %s 失败: %s", raw_symbol, e)
             return None
@@ -200,17 +312,20 @@ class EtfDataManager:
         incremental: bool = True,
         sleep_min: float = 1.0,
         sleep_max: float = 2.0,
+        retry_rounds: int = 1,
     ) -> dict[str, int]:
         """批量下载 ETF 池中所有标的。
 
         Parameters
         ----------
         period : str
-            yfinance period（仅在全量下载时生效）。
+            yfinance period 或 "from2014"（仅在全量下载时生效）。
         incremental : bool
             是否增量更新。
         sleep_min, sleep_max : float
             每下载一只 ETF 后，随机等待 [sleep_min, sleep_max] 秒再下载下一只，防止限流。
+        retry_rounds : int
+            失败标的自动重试轮数；每轮前等待约 60 秒以缓解限流。
 
         Returns
         -------
@@ -222,38 +337,49 @@ class EtfDataManager:
         ok = skip = fail = 0
         failed_symbols: list[str] = []
 
-        logger.info("开始下载，共 %d 只 ETF ...", total)
+        logger.info("开始下载，共 %d 只 ETF，period=%s，重试轮数=%d ...", total, period, retry_rounds)
 
-        for i, sym in enumerate(symbols, 1):
-            file_path = self._file_path(sym)
-            already_fresh = False
-            if incremental and file_path.exists():
-                existing = pd.read_csv(file_path, index_col=0, parse_dates=True)
-                if not existing.empty:
-                    last_date = existing.index.max()
-                    if (datetime.now() - last_date).days <= 1:
-                        skip += 1
-                        logger.debug("[%d/%d] %s 已是最新，跳过", i, total, sym)
-                        already_fresh = True
+        for round_no in range(max(1, retry_rounds)):
+            if round_no > 0:
+                remaining = failed_symbols.copy()
+                if not remaining:
+                    break
+                wait_sec = min(90, 45 + round_no * 20)
+                logger.info("第 %d 轮重试，共 %d 只失败标的，等待 %ds 后继续 ...", round_no + 1, len(remaining), wait_sec)
+                time.sleep(wait_sec)
+                symbols_this_round = remaining
+                failed_symbols = []
+            else:
+                symbols_this_round = symbols
 
-            if not already_fresh:
-                result = self.download_one(sym, period=period, incremental=incremental)
-                if result is not None:
-                    ok += 1
-                    logger.info(
-                        "[%d/%d] %s 完成，共 %d 行", i, total, sym, len(result)
-                    )
-                else:
-                    fail += 1
-                    failed_symbols.append(sym)
-                    logger.warning("[%d/%d] %s 失败", i, total, sym)
-                # 每下载一只后随机间隔 1~2 秒再下载下一只
-                time.sleep(random.uniform(sleep_min, sleep_max))
+            for i, sym in enumerate(symbols_this_round, 1):
+                file_path = self._file_path(sym)
+                already_fresh = False
+                if incremental and file_path.exists():
+                    existing = pd.read_csv(file_path, index_col=0, parse_dates=True)
+                    if not existing.empty:
+                        last_date = existing.index.max()
+                        if (datetime.now() - last_date).days <= 1:
+                            skip += 1
+                            logger.debug("[%d/%d] %s 已是最新，跳过", i, len(symbols_this_round), sym)
+                            already_fresh = True
+
+                if not already_fresh:
+                    result = self.download_one(sym, period=period, incremental=incremental)
+                    if result is not None:
+                        ok += 1
+                        logger.info(
+                            "[%d/%d] %s 完成，共 %d 行", i, len(symbols_this_round), sym, len(result)
+                        )
+                    else:
+                        failed_symbols.append(sym)
+                        logger.warning("[%d/%d] %s 失败", i, len(symbols_this_round), sym)
+                    time.sleep(random.uniform(sleep_min, sleep_max))
 
         summary = {
             "ok": ok,
             "skip": skip,
-            "fail": fail,
+            "fail": len(failed_symbols),
             "failed_symbols": failed_symbols,
         }
         logger.info("下载完成: %s", summary)
@@ -330,24 +456,50 @@ def main():
     parser.add_argument("--pool", default=str(DEFAULT_POOL_CSV), help="ETF 池 CSV 路径")
     parser.add_argument("--db", default=str(DEFAULT_DB_DIR), help="本地存储目录")
     parser.add_argument("--proxy", default=None, help="HTTP(S) 代理，如 http://127.0.0.1:1087")
-    parser.add_argument("--period", default=DEFAULT_PERIOD, help="下载周期（全量时生效），默认 12y")
+    parser.add_argument("--source", default="akshare", choices=("akshare", "yfinance"), help="数据源，默认 akshare 避免异常涨跌幅")
+    parser.add_argument("--period", default=DEFAULT_PERIOD, help="下载周期（全量时生效），12y / from2014 等")
+    parser.add_argument("--from-2014", action="store_true", help="全量时从 2014-01-01 开始下载（等同 --period from2014）")
     parser.add_argument("--full", action="store_true", help="全量下载（忽略本地已有数据）")
+    parser.add_argument("--clear-db", action="store_true", help="下载前清空 db 目录下所有 CSV（与 --full 配合使用）")
     parser.add_argument("--sleep-min", type=float, default=1.0, help="下载间隔下限（秒）")
     parser.add_argument("--sleep-max", type=float, default=2.0, help="下载间隔上限（秒）")
+    parser.add_argument("--retry-rounds", type=int, default=1, help="失败标的自动重试轮数（全量建议 5）")
     parser.add_argument("--status", action="store_true", help="仅查看本地数据状态")
     args = parser.parse_args()
 
-    mgr = EtfDataManager(pool_csv=args.pool, db_dir=args.db, proxy=args.proxy)
+    db_dir = Path(args.db)
+    if args.clear_db:
+        cleared = 0
+        for fp in db_dir.glob("*.csv"):
+            fp.unlink()
+            cleared += 1
+        if cleared:
+            logger.info("已清空 db：删除 %d 个 CSV", cleared)
+
+    mgr = EtfDataManager(pool_csv=args.pool, db_dir=args.db, proxy=args.proxy, data_source=args.source)
 
     if args.status:
         print(mgr.status().to_string(index=False))
         return
 
+    period = "from2014" if args.from_2014 else args.period
+    if args.full and not args.from_2014 and args.period == DEFAULT_PERIOD:
+        period = "from2014"
+        logger.info("全量下载使用 from2014（2014-01-01 起）")
+    sleep_min = args.sleep_min
+    sleep_max = args.sleep_max
+    retry_rounds = args.retry_rounds
+    if args.full:
+        sleep_min = max(sleep_min, 1.2)
+        sleep_max = max(sleep_max, 2.5)
+        retry_rounds = max(retry_rounds, 3)
+
     result = mgr.download_all(
-        period=args.period,
+        period=period,
         incremental=not args.full,
-        sleep_min=args.sleep_min,
-        sleep_max=args.sleep_max,
+        sleep_min=sleep_min,
+        sleep_max=sleep_max,
+        retry_rounds=retry_rounds,
     )
     print(f"\n下载完成: 成功 {result['ok']}, 跳过 {result['skip']}, 失败 {result['fail']}")
     if result["failed_symbols"]:
