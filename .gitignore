@@ -1,12 +1,3 @@
-# 数据文件
-*.csv
-!db/*.csv
-!db/**/*.csv
-*.xlsx
-
-# 输出目录
-history/
-output.png
 
 # Python
 __pycache__/
