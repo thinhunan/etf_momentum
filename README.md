@@ -99,6 +99,10 @@ engine.update_db_incremental(
 - **etf_data_manager.py**：基于 yfinance 拉取并落库，支持增量、代理、12 年周期、随机间隔防限流。
 - **momentum_backtest.ipynb**：加载 `db/` 数据，运行上述动量+R² 策略的参数扫描回测，输出逐年/年化收益与图表。
 
+
+
+---
+
 ## 依赖与运行
 
 - 依赖：`yfinance`、`pandas`、`numpy`、`matplotlib`（见 `requirements.txt`）。
