@@ -359,7 +359,7 @@ class EtfDataManager:
                 if os.environ.get("EASTMONEY_SSL_VERIFY", "1") == "0":
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
-                with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+                with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
                     data = json.loads(r.read().decode())
                 if not data.get("data") or not data["data"].get("klines"):
                     return pd.DataFrame()
@@ -384,7 +384,8 @@ class EtfDataManager:
                 if attempt >= self.max_retries:
                     logger.warning("东方财富直连 %s 失败: %s", raw_symbol, e)
                     return pd.DataFrame()
-                time.sleep(min(30, 2 ** attempt))
+                backoff = min(30, 2 ** attempt + random.uniform(0, 1))
+                time.sleep(backoff)
         return pd.DataFrame()
 
     def download_one(
@@ -422,6 +423,11 @@ class EtfDataManager:
                 if start_d >= end_d:
                     logger.debug("%s 已是最新，跳过", raw_symbol)
                     return existing
+                # eastmoney 增量只拉最近几日，减轻请求量、降低超时/限流
+                if self._data_source == "eastmoney":
+                    end_cap = (last_date + timedelta(days=7)).strftime("%Y-%m-%d")
+                    if end_d > end_cap:
+                        end_d = end_cap
                 try:
                     if self._data_source == "akshare":
                         new_data = self._fetch_history_akshare(
@@ -523,6 +529,7 @@ class EtfDataManager:
             是否增量更新。
         sleep_min, sleep_max : float
             每下载一只 ETF 后，随机等待 [sleep_min, sleep_max] 秒再下载下一只，防止限流。
+            使用 eastmoney 时建议加大间隔（如 2~4 秒），避免 ProxyError/限流。
         retry_rounds : int
             失败标的自动重试轮数；每轮前等待约 60 秒以缓解限流。
 
@@ -535,6 +542,11 @@ class EtfDataManager:
         total = len(symbols)
         ok = skip = fail = 0
         failed_symbols: list[str] = []
+
+        # eastmoney 直连易限流/代理断开，默认加大请求间隔（串行，无并发）
+        if self._data_source == "eastmoney" and sleep_min == 1.0 and sleep_max == 2.0:
+            sleep_min, sleep_max = 2.0, 4.0
+            logger.info("eastmoney 数据源：使用限流间隔 %.1f~%.1f 秒（串行请求）", sleep_min, sleep_max)
 
         logger.info("开始下载，共 %d 只 ETF，period=%s，重试轮数=%d ...", total, period, retry_rounds)
 

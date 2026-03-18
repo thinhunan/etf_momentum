@@ -90,7 +90,8 @@ class EtfMomentum:
         - 若本地已有 CSV：从最后日期 +1 天开始下载并追加
         - 若本地没有 CSV：下载 period_for_new 对应的全量数据并写入
         - 若遇到限流/网络错误：按“轮次”重试失败标的，最多 max_rounds 轮
-        - update_source: "yfinance" | "akshare"，推荐 "akshare" 避免沪深 ETF 异常涨跌幅
+        - update_source: "yfinance" | "akshare" | "eastmoney" | "efinance" | "baostock"
+          推荐 "akshare"；用 "eastmoney" 时请求为串行且会限流（约 2~4 秒/只），增量只拉最近 7 日。
         """
         if proxy:
             os.environ["HTTP_PROXY"] = proxy
@@ -99,13 +100,16 @@ class EtfMomentum:
         if symbols is None:
             symbols = sorted([fp.stem for fp in self._db_dir.glob("*.csv")])
 
-        use_akshare = (update_source or "").strip().lower() == "akshare"
-        if use_akshare:
+        src = (update_source or "yfinance").strip().lower()
+        use_data_mgr = src in ("akshare", "eastmoney", "efinance", "baostock")
+        if use_data_mgr:
             try:
                 from etf_data_manager import EtfDataManager
             except ImportError:
                 from .etf_data_manager import EtfDataManager
-            data_mgr = EtfDataManager(db_dir=str(self._db_dir), proxy=proxy, data_source="akshare")
+            data_mgr = EtfDataManager(db_dir=str(self._db_dir), proxy=proxy, data_source=src)
+            if src == "eastmoney" and sleep_min == 1.0 and sleep_max == 2.0:
+                sleep_min, sleep_max = 2.0, 4.0
 
         remaining = [s.strip().upper() for s in symbols]
         ok: set[str] = set()
@@ -119,7 +123,7 @@ class EtfMomentum:
 
             for sym in remaining:
                 try:
-                    if use_akshare:
+                    if use_data_mgr:
                         result = data_mgr.download_one(sym, period=period_for_new, incremental=True)
                         if result is None:
                             raise RuntimeError("download_one 返回 None")

@@ -45,6 +45,51 @@ engine.update_db_incremental(
 # 更新完后 engine 会自动 reload 数据（可用于下一步 next/back_history）
 ```
 
+---
+
+## 雪球 ETF 日更工具（`xueqiu_etf_daily.py`）
+
+休市后用**雪球 API** 自动拉取当日行情，追加到 `db/*.csv`，**每 20 秒请求一次**，避免限流。适合每天跑一次补当天数据，无需在 notebook 里做数据更新。
+
+**依赖**：`requests`（见 `requirements.txt`）。
+
+### 用法
+
+| 命令 | 说明 |
+|------|------|
+| `python xueqiu_etf_daily.py --daemon` | **常驻**：每天 16:00 后检查是否为交易日，若是则用 quotec 接口补当日数据，逐只写入 db，每只间隔 20 秒。 |
+| `python xueqiu_etf_daily.py --once` | **单次**：若今天为交易日则补一次当日数据后退出。 |
+| `python xueqiu_etf_daily.py --from 20260316` | **补历史**：从指定日期起用 kline 接口拉取到昨天，只**新增** CSV 中不存在的日期，不覆盖已有行；每只间隔 20 秒。 |
+
+### 可选参数
+
+- `--db PATH`：指定 db 目录，默认 `./db`。
+- `--delay N`：请求间隔秒数，默认 20。
+
+### 示例
+
+```bash
+# 控制台常驻，每天 16 点后自动补当日
+python xueqiu_etf_daily.py --daemon
+
+# 只补今天（若为交易日）
+python xueqiu_etf_daily.py --once
+
+# 从 2026-03-16 起补历史到昨天
+python xueqiu_etf_daily.py --from 20260316
+
+# 自定义目录与间隔
+python xueqiu_etf_daily.py --db ./db --delay 20 --once
+```
+
+### 说明
+
+- **标的列表**：从 `db/` 下已有 CSV 文件名读取（如 `SH510500.csv` → `SH510500`），无需单独配置池。
+- **只新增不覆盖**：若某日数据在 CSV 中已存在，则跳过，不改写。
+- **交易日**：脚本内用周一～周五 + 简单节假日列表判断；节假日可在 `xueqiu_etf_daily.py` 中修改 `CN_HOLIDAYS`。
+
+---
+
 ### 1. 策略思路
 
 - **动量**：用过去一段时间价格走势的“斜率”衡量强弱，斜率大视为动量强。
@@ -97,6 +142,7 @@ engine.update_db_incremental(
 - **etf_pool.csv**：ETF 候选池（代码、名称、类型等）。
 - **db/**：每只 ETF 的日线 OHLCV CSV，由 `etf_data_manager` 下载写入。
 - **etf_data_manager.py**：基于 yfinance 拉取并落库，支持增量、代理、12 年周期、随机间隔防限流。
+- **xueqiu_etf_daily.py**：雪球日更工具，16 点后补当日数据或 `--from` 补历史，20 秒/请求，只追加不覆盖。
 - **momentum_backtest.ipynb**：加载 `db/` 数据，运行上述动量+R² 策略的参数扫描回测，输出逐年/年化收益与图表。
 
 

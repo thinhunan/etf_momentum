@@ -8,7 +8,7 @@
 |--------|------|----------|--------|
 | **akshare** | 东方财富（fund_etf_hist_em），前复权 | ✅ 完整 | ⭐⭐⭐ 默认推荐 |
 | **efinance** | 东方财富封装库，ETF 用股票接口 | ✅ 完整 | ⭐⭐⭐ 可作备用 |
-| **eastmoney** | 东方财富 K 线直连 API | ✅ 完整 | ⭐⭐ 需网络/证书正常；证书异常时可设 `EASTMONEY_SSL_VERIFY=0` |
+| **eastmoney** | 东方财富 K 线直连 API | ✅ 完整 | ⭐⭐ 串行请求+限流(2~4秒/只)；增量仅拉最近 7 日；证书异常可设 `EASTMONEY_SSL_VERIFY=0`；代理异常可设 `NO_PROXY=push2his.eastmoney.com` |
 | **yfinance** | Yahoo Finance | ⚠️ 部分沪深 ETF 异常涨跌幅 | ⭐ 不推荐 |
 | **baostock** | 证券宝 | ❌ 实测 ETF 返回 0 行，仅 A 股 | 仅 A 股时用 |
 
